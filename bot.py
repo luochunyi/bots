@@ -10,7 +10,7 @@ import json
 import time
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, time as dt_time
 from typing import List, Dict, Optional
 
 import discord
@@ -33,8 +33,10 @@ DISCORD_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', 0))
 
 # Constants
 ARC_RAIDERS_URL = 'https://arcraiders.com/map-conditions'
-UPDATE_INTERVAL_MINUTES = 15
 BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+# Fire at every XX:00 and XX:30 UTC
+UPDATE_TIMES = [dt_time(hour=h, minute=m) for h in range(24) for m in (0, 30)]
 
 
 class ARCRaidersAPI:
@@ -112,6 +114,13 @@ class ConditionBot(discord.Client):
             logger.error(f"Could not find channel with ID {self.channel_id}")
             return
 
+        # Set server nickname
+        try:
+            await channel.guild.me.edit(nick="SuckBot.69")
+            logger.info("Set server nickname to SuckBot.69")
+        except discord.Forbidden:
+            logger.warning("Missing permissions to change nickname")
+
         logger.info(f"Using channel: #{channel.name}")
 
         perms = channel.permissions_for(channel.guild.me)
@@ -131,7 +140,7 @@ class ConditionBot(discord.Client):
         """Called when bot disconnects"""
         logger.warning("Bot disconnected")
 
-    @tasks.loop(minutes=UPDATE_INTERVAL_MINUTES)
+    @tasks.loop(time=UPDATE_TIMES)
     async def update_conditions(self):
         """Periodically fetch and update map conditions"""
         try:
