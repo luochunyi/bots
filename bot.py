@@ -102,6 +102,7 @@ class ConditionBot(discord.Client):
         super().__init__(*args, **kwargs)
         self.channel_id = DISCORD_CHANNEL_ID
         self.current_pin: Optional[discord.Message] = None
+        self.current_pin_verified: bool = False  # True once we know it's pinned
         self.schedule_message: Optional[discord.Message] = None
 
     async def on_ready(self):
@@ -133,8 +134,9 @@ class ConditionBot(discord.Client):
             f"pin_messages={pin_perm}"
         )
 
-        # Start the update task
-        self.update_conditions.start()
+        # Start the update task (on_ready fires again after reconnects)
+        if not self.update_conditions.is_running():
+            self.update_conditions.start()
 
     async def on_disconnect(self):
         """Called when bot disconnects"""
@@ -283,6 +285,23 @@ class ConditionBot(discord.Client):
         except Exception as e:
             logger.error(f"Error posting schedule message: {e}", exc_info=True)
 
+    async def _ensure_pinned(self, message: discord.Message):
+        """Pin a message if it isn't already confirmed pinned."""
+        if self.current_pin_verified:
+            return
+        try:
+            pins = await message.channel.pins()
+            if message.id in {p.id for p in pins}:
+                self.current_pin_verified = True
+                return
+            await message.pin()
+            self.current_pin_verified = True
+            logger.info("Pinned current event message")
+        except discord.Forbidden as e:
+            logger.warning(f"Could not pin current event message — {e}")
+        except discord.HTTPException as e:
+            logger.warning(f"Failed to pin message (50-pin limit?) — {e}")
+
     async def post_or_update_current_pin(self, content: str):
         """Post or update the pinned current-event header message."""
         channel = self.get_channel(self.channel_id)
@@ -293,26 +312,36 @@ class ConditionBot(discord.Client):
             if self.current_pin:
                 try:
                     await self.current_pin.edit(content=content)
+                    await self._ensure_pinned(self.current_pin)
                     logger.info("Updated current event pin")
                     return
                 except discord.NotFound:
                     logger.warning("Current event pin no longer exists, recreating")
                     self.current_pin = None
+                    self.current_pin_verified = False
 
-            async for pin in channel.pins():
+            # Search pinned messages first
+            for pin in await channel.pins():
                 if pin.author == self.user and "Current Map Condition" in pin.content:
                     self.current_pin = pin
+                    self.current_pin_verified = True  # found in pins → already pinned
                     await self.current_pin.edit(content=content)
                     logger.info("Found and updated existing current event pin")
                     return
 
+            # Fallback: search recent history for an unpinned match
+            self.current_pin_verified = False
+            async for msg in channel.history(limit=50):
+                if msg.author == self.user and "Current Map Condition" in msg.content:
+                    self.current_pin = msg
+                    await self.current_pin.edit(content=content)
+                    await self._ensure_pinned(self.current_pin)
+                    logger.info("Found unpinned current event message in history, updated and re-pinned")
+                    return
+
             self.current_pin = await channel.send(content=content)
             logger.info("Posted new current event message")
-            try:
-                await self.current_pin.pin()
-                logger.info("Pinned current event message")
-            except discord.Forbidden as e:
-                logger.warning(f"Could not pin current event message — {e}")
+            await self._ensure_pinned(self.current_pin)
 
         except discord.Forbidden as e:
             logger.error(f"Missing permissions to post messages — {e}")
