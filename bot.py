@@ -56,24 +56,28 @@ class ARCRaidersAPI:
             html_content = response.text
             logger.info("Successfully fetched HTML content")
 
-            # Find script blocks matching self.__next_f.push([1,"...liveEntries..."])
-            pattern = r'self\.__next_f\.push\(\[1,"([^"]+)"\]\)'
-            matches = re.findall(pattern, html_content)
+            # Find the script block containing liveEntries
+            pattern = r'self\.__next_f\.push\(\[1,"(.*liveEntries.*?)"\]\)'
+            script_match = re.search(pattern, html_content, re.DOTALL)
 
-            for match in matches:
-                if 'liveEntries' in match:
-                    # Unescape the string
-                    unescaped = match.replace(r'\"', '"').replace(r'\\', '\\')
+            if not script_match:
+                logger.error("Script block not found")
+                return None
 
-                    # Extract JSON array between "liveEntries": and ,"currentCondition"
-                    entries_pattern = r'"liveEntries":\s*(\[.*?\])(?=\s*,\s*"currentCondition")'
-                    entries_match = re.search(entries_pattern, unescaped, re.DOTALL)
+            # Unescape the JavaScript string
+            unescaped = (script_match.group(1)
+                         .replace(r'\"', '"')
+                         .replace(r'\\', '\\')
+                         .replace(r'\n', ''))
 
-                    if entries_match:
-                        json_str = entries_match.group(1)
-                        events = json.loads(json_str)
-                        logger.info(f"Successfully parsed {len(events)} events")
-                        return events
+            # Extract liveEntries JSON array
+            entries_pattern = r'"liveEntries":(\[.*?\]),"currentCondition"'
+            entries_match = re.search(entries_pattern, unescaped, re.DOTALL)
+
+            if entries_match:
+                events = json.loads(entries_match.group(1))
+                logger.info(f"Successfully parsed {len(events)} events")
+                return events
 
             logger.error("Could not find liveEntries in HTML content")
             return None
@@ -95,7 +99,8 @@ class ConditionBot(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.channel_id = DISCORD_CHANNEL_ID
-        self.pinned_message: Optional[discord.Message] = None
+        self.current_pin: Optional[discord.Message] = None
+        self.schedule_message: Optional[discord.Message] = None
 
     async def on_ready(self):
         """Called when bot is ready"""
@@ -108,6 +113,16 @@ class ConditionBot(discord.Client):
             return
 
         logger.info(f"Using channel: #{channel.name}")
+
+        perms = channel.permissions_for(channel.guild.me)
+        pin_perm = getattr(perms, 'pin_messages', 'N/A (update discord.py)')
+        logger.info(
+            f"Bot permissions in #{channel.name}: "
+            f"send_messages={perms.send_messages}, "
+            f"manage_messages={perms.manage_messages}, "
+            f"read_message_history={perms.read_message_history}, "
+            f"pin_messages={pin_perm}"
+        )
 
         # Start the update task
         self.update_conditions.start()
@@ -127,8 +142,8 @@ class ConditionBot(discord.Client):
                 logger.error("Failed to fetch map conditions")
                 return
 
-            message_content = self.format_conditions_message(events)
-            await self.post_or_update_message(message_content)
+            await self.post_or_update_current_pin(self.format_current_event_message(events))
+            await self.post_schedule_message(self.format_conditions_message(events))
 
         except Exception as e:
             logger.error(f"Error in update task: {e}", exc_info=True)
@@ -137,6 +152,28 @@ class ConditionBot(discord.Client):
     async def before_update(self):
         """Wait until bot is ready before starting updates"""
         await self.wait_until_ready()
+
+    def format_current_event_message(self, events: List[Dict]) -> str:
+        """Format a compact message showing only the active event for the pinned header."""
+        current_time_ms = int(time.time() * 1000)
+        active_events = [
+            e for e in events
+            if e['startTimestamp'] <= current_time_ms <= e['endTimestamp']
+        ]
+
+        lines = ["## 🔴 Current Map Condition"]
+        if active_events:
+            for event in active_events:
+                end_time = event['endTimestamp'] // 1000
+                lines.append(
+                    f"**{event['conditionName']}** on **{event['mapDisplayName']}**\n"
+                    f"└ Ends: <t:{end_time}:t> (<t:{end_time}:R>)"
+                )
+        else:
+            lines.append("*No active events*")
+
+        lines.append(f"\n*Updated: <t:{int(time.time())}:R>*")
+        return "\n".join(lines)
 
     def format_conditions_message(self, events: List[Dict]) -> str:
         """
@@ -203,49 +240,81 @@ class ConditionBot(discord.Client):
 
         return "\n".join(lines)
 
-    async def post_or_update_message(self, content: str):
-        """
-        Post a new message or update the existing pinned message
-
-        Args:
-            content: Message content
-        """
+    async def post_schedule_message(self, content: str):
+        """Send or edit the full schedule message (not pinned)."""
         channel = self.get_channel(self.channel_id)
         if not channel:
             logger.error(f"Channel {self.channel_id} not found")
             return
 
         try:
-            # Try to update existing pinned message
-            if self.pinned_message:
+            if self.schedule_message:
                 try:
-                    await self.pinned_message.edit(content=content)
-                    logger.info("Updated existing message")
+                    await self.schedule_message.edit(content=content)
+                    logger.info("Updated existing schedule message")
                     return
                 except discord.NotFound:
-                    logger.warning("Pinned message no longer exists, creating new one")
-                    self.pinned_message = None
+                    self.schedule_message = None
 
-            # Find existing pinned message from this bot
-            pins = await channel.pins()
-            for pin in pins:
-                if pin.author == self.user and "ARC Raiders Map Conditions" in pin.content:
-                    self.pinned_message = pin
-                    await self.pinned_message.edit(content=content)
-                    logger.info("Found and updated existing pinned message")
-                    return
+            self.schedule_message = await channel.send(content=content)
+            logger.info("Posted new schedule message")
 
-            # Create new message and pin it
-            self.pinned_message = await channel.send(content=content)
-            await self.pinned_message.pin()
-            logger.info("Posted and pinned new message")
-
-        except discord.Forbidden:
-            logger.error("Missing permissions to post/pin messages")
+        except discord.Forbidden as e:
+            logger.error(f"Missing permissions to post messages — {e}")
         except discord.HTTPException as e:
             logger.error(f"Discord API error: {e}")
         except Exception as e:
-            logger.error(f"Error posting/updating message: {e}", exc_info=True)
+            logger.error(f"Error posting schedule message: {e}", exc_info=True)
+
+    async def post_or_update_current_pin(self, content: str):
+        """Post or update the pinned current-event header message."""
+        channel = self.get_channel(self.channel_id)
+        if not channel:
+            return
+
+        try:
+            if self.current_pin:
+                try:
+                    await self.current_pin.edit(content=content)
+                    logger.info("Updated current event pin")
+                    return
+                except discord.NotFound:
+                    logger.warning("Current event pin no longer exists, recreating")
+                    self.current_pin = None
+
+            async for pin in channel.pins():
+                if pin.author == self.user and "Current Map Condition" in pin.content:
+                    self.current_pin = pin
+                    await self.current_pin.edit(content=content)
+                    logger.info("Found and updated existing current event pin")
+                    return
+
+            self.current_pin = await channel.send(content=content)
+            logger.info("Posted new current event message")
+            try:
+                await self.current_pin.pin()
+                logger.info("Pinned current event message")
+            except discord.Forbidden as e:
+                logger.warning(f"Could not pin current event message — {e}")
+
+        except discord.Forbidden as e:
+            logger.error(f"Missing permissions to post messages — {e}")
+        except discord.HTTPException as e:
+            logger.error(f"Discord API error: {e}")
+        except Exception as e:
+            logger.error(f"Error posting/updating current event pin: {e}", exc_info=True)
+
+    async def on_message(self, message: discord.Message):
+        """Handle incoming messages for commands."""
+        if message.author == self.user:
+            return
+        if message.content.strip() == '!conditions':
+            events = ARCRaidersAPI.fetch_map_conditions()
+            if events is None:
+                await message.channel.send("Failed to fetch map conditions.")
+                return
+            await self.post_or_update_current_pin(self.format_current_event_message(events))
+            await message.channel.send(content=self.format_conditions_message(events))
 
 
 def main():
@@ -259,6 +328,8 @@ def main():
         return
 
     # Set up intents
+    # message_content is a privileged intent — enable it at:
+    # https://discord.com/developers/applications/ → Bot → Privileged Gateway Intents
     intents = discord.Intents.default()
     intents.message_content = True
 
