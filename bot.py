@@ -265,6 +265,14 @@ class ConditionBot(discord.Client):
                 except discord.NotFound:
                     self.schedule_message = None
 
+            # Recover reference after restart by scanning history
+            async for msg in channel.history(limit=50):
+                if msg.author == self.user and "ARC Raiders Map Conditions" in msg.content:
+                    self.schedule_message = msg
+                    await self.schedule_message.edit(content=content)
+                    logger.info("Found and updated existing schedule message from history")
+                    return
+
             self.schedule_message = await channel.send(content=content)
             logger.info("Posted new schedule message")
 
