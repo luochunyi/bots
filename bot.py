@@ -29,6 +29,15 @@ DISCORD_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', 0))
 
 # Constants
 EVENTS_API_URL = 'https://metaforge.app/api/arc-raiders/events-schedule'
+TRADERS_API_URL = 'https://metaforge.app/api/arc-raiders/traders'
+
+RARITY_EMOJI = {
+    'Common': '⬜',
+    'Uncommon': '🟩',
+    'Rare': '🟦',
+    'Epic': '🟪',
+    'Legendary': '🟧',
+}
 
 
 class ARCRaidersAPI:
@@ -54,6 +63,28 @@ class ARCRaidersAPI:
             return None
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
+            return None
+
+    @staticmethod
+    def fetch_traders() -> Optional[Dict[str, List[Dict]]]:
+        """
+        Fetch trader inventory data from the Metaforge API.
+
+        Returns:
+            Dict mapping trader name -> list of items, or None on error.
+        """
+        try:
+            response = requests.get(TRADERS_API_URL, timeout=10)
+            response.raise_for_status()
+            data = response.json()
+            traders = data.get('data', {})
+            logger.info(f"Successfully fetched traders: {list(traders.keys())}")
+            return traders
+        except requests.RequestException as e:
+            logger.error(f"Error fetching traders: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error fetching traders: {e}")
             return None
 
 
@@ -312,17 +343,67 @@ class ConditionBot(discord.Client):
         except Exception as e:
             logger.error(f"Error posting/updating current event pin: {e}", exc_info=True)
 
+    @staticmethod
+    def _split_message(text: str, limit: int = 2000) -> List[str]:
+        """Split a message into chunks that fit within Discord's character limit."""
+        chunks, current = [], []
+        current_len = 0
+        for line in text.split('\n'):
+            # +1 for the newline we'll rejoin with
+            if current_len + len(line) + 1 > limit and current:
+                chunks.append('\n'.join(current))
+                current, current_len = [], 0
+            current.append(line)
+            current_len += len(line) + 1
+        if current:
+            chunks.append('\n'.join(current))
+        return chunks
+
+    def format_trader_message(self, trader_name: str, items: List[Dict]) -> str:
+        """Format a trader's inventory into a Discord message."""
+        lines = [f"# 🛒 {trader_name}'s Inventory\n"]
+        for item in items:
+            emoji = RARITY_EMOJI.get(item.get('rarity', ''), '⬜')
+            price = f"{item['trader_price']:,}" if item.get('trader_price') else 'N/A'
+            lines.append(
+                f"{emoji} **{item['name']}** — {item.get('rarity', '?')} {item.get('item_type', '')}\n"
+                f"└ Price: **{price}** | {item.get('description', '')}"
+            )
+        return "\n".join(lines)
+
     async def on_message(self, message: discord.Message):
         """Handle incoming messages for commands."""
         if message.author == self.user:
             return
-        if message.content.strip() == '!conditions':
+
+        content = message.content.strip()
+
+        if content == '!conditions':
             events = ARCRaidersAPI.fetch_map_conditions()
             if events is None:
                 await message.channel.send("Failed to fetch map conditions.")
                 return
             await self.post_or_update_current_pin(self.format_current_event_message(events))
             await message.channel.send(content=self.format_conditions_message(events))
+
+        elif content.lower().startswith('!traders '):
+            traders = ARCRaidersAPI.fetch_traders()
+            if traders is None:
+                await message.channel.send("Failed to fetch trader data.")
+                return
+
+            requested = content[9:].strip()
+            # Case-insensitive match against available trader names
+            match = next((name for name in traders if name.lower() == requested.lower()), None)
+            if match is None:
+                available = ', '.join(f'`{n}`' for n in sorted(traders.keys()))
+                await message.channel.send(
+                    f"Unknown trader **{requested}**. Available traders: {available}"
+                )
+                return
+
+            for chunk in self._split_message(self.format_trader_message(match, traders[match])):
+                await message.channel.send(content=chunk)
 
 
 def main():
