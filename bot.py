@@ -9,9 +9,9 @@ import time
 import logging
 from typing import List, Dict, Optional
 
+import aiohttp
 import discord
-from discord.ext import tasks
-import requests
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 # Configure logging
@@ -41,100 +41,95 @@ RARITY_EMOJI = {
 }
 
 
+def in_bot_channel():
+    """Check decorator: only allow commands in the configured channel."""
+    async def predicate(ctx: commands.Context) -> bool:
+        if ctx.channel.id != DISCORD_CHANNEL_ID:
+            return False
+        return True
+    return commands.check(predicate)
+
+
 class ARCRaidersAPI:
-    """Handles fetching ARC Raiders event schedule data"""
+    """Handles fetching ARC Raiders data via aiohttp (non-blocking)."""
 
-    @staticmethod
-    def fetch_map_conditions() -> Optional[List[Dict]]:
-        """
-        Fetch event schedule from the Metaforge API.
+    def __init__(self, session: aiohttp.ClientSession):
+        self.session = session
 
-        Returns:
-            List of event dictionaries or None on error.
-        """
+    async def fetch_map_conditions(self) -> Optional[List[Dict]]:
+        """Fetch event schedule from the Metaforge API."""
         try:
-            response = requests.get(EVENTS_API_URL, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+            async with self.session.get(EVENTS_API_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
             events = data.get('data', [])
             logger.info(f"Successfully fetched {len(events)} events")
             return events
-        except requests.RequestException as e:
-            logger.error(f"Error fetching data: {e}")
-            return None
         except Exception as e:
-            logger.error(f"Unexpected error: {e}")
+            logger.error(f"Error fetching events: {e}")
             return None
 
-    @staticmethod
-    def fetch_traders() -> Optional[Dict[str, List[Dict]]]:
-        """
-        Fetch trader inventory data from the Metaforge API.
-
-        Returns:
-            Dict mapping trader name -> list of items, or None on error.
-        """
+    async def fetch_traders(self) -> Optional[Dict[str, List[Dict]]]:
+        """Fetch trader inventory data from the Metaforge API."""
         try:
-            response = requests.get(TRADERS_API_URL, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+            async with self.session.get(TRADERS_API_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
             traders = data.get('data', {})
             logger.info(f"Successfully fetched traders: {list(traders.keys())}")
             return traders
-        except requests.RequestException as e:
+        except Exception as e:
             logger.error(f"Error fetching traders: {e}")
             return None
-        except Exception as e:
-            logger.error(f"Unexpected error fetching traders: {e}")
-            return None
 
-    @staticmethod
-    def fetch_items(query: str) -> Optional[Dict]:
-        """
-        Search items by name via the Metaforge API.
-
-        Returns:
-            Dict with 'data' (list of items) and 'pagination', or None on error.
-        """
+    async def fetch_items(self, query: str) -> Optional[Dict]:
+        """Search items by name via the Metaforge API."""
         try:
-            response = requests.get(
-                ITEMS_API_URL,
-                params={'search': query, 'limit': 50, 'includeComponents': 'true'},
-                timeout=10,
-            )
-            response.raise_for_status()
-            data = response.json()
-            logger.info(f"Item search '{query}' returned {data['pagination']['total']} results")
+            params = {'search': query[:100], 'limit': 50, 'includeComponents': 'true'}
+            async with self.session.get(ITEMS_API_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+            total = data.get('pagination', {}).get('total', 0)
+            logger.info(f"Item search '{query}' returned {total} results")
             return data
-        except requests.RequestException as e:
+        except Exception as e:
             logger.error(f"Error fetching items: {e}")
             return None
-        except Exception as e:
-            logger.error(f"Unexpected error fetching items: {e}")
-            return None
 
 
-class ConditionBot(discord.Client):
+class ConditionBot(commands.Bot):
     """Discord bot for posting ARC Raiders map conditions"""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.channel_id = DISCORD_CHANNEL_ID
         self.current_pin: Optional[discord.Message] = None
-        self.current_pin_verified: bool = False  # True once we know it's pinned
+        self.current_pin_verified: bool = False
         self.schedule_message: Optional[discord.Message] = None
+        self.http_session: Optional[aiohttp.ClientSession] = None
+        self.api: Optional[ARCRaidersAPI] = None
+
+    async def setup_hook(self):
+        """Called once before the bot connects — create shared aiohttp session."""
+        self.http_session = aiohttp.ClientSession()
+        self.api = ARCRaidersAPI(self.http_session)
+        await self.add_cog(ConditionCommands(self))
+
+    async def close(self):
+        """Clean up the aiohttp session on shutdown."""
+        if self.http_session:
+            await self.http_session.close()
+        await super().close()
 
     async def on_ready(self):
         """Called when bot is ready"""
         logger.info(f'Logged in as {self.user}')
 
-        # Validate channel
         channel = self.get_channel(self.channel_id)
         if not channel:
             logger.error(f"Could not find channel with ID {self.channel_id}")
             return
 
-        # Set server nickname
         try:
             await channel.guild.me.edit(nick="SuckBot.69")
             logger.info("Set server nickname to SuckBot.69")
@@ -144,7 +139,7 @@ class ConditionBot(discord.Client):
         logger.info(f"Using channel: #{channel.name}")
 
         perms = channel.permissions_for(channel.guild.me)
-        pin_perm = getattr(perms, 'pin_messages', 'N/A (update discord.py)')
+        pin_perm = getattr(perms, 'pin_messages', 'N/A')
         logger.info(
             f"Bot permissions in #{channel.name}: "
             f"send_messages={perms.send_messages}, "
@@ -166,7 +161,7 @@ class ConditionBot(discord.Client):
         """Periodically fetch and update map conditions"""
         try:
             logger.info("Fetching map conditions...")
-            events = ARCRaidersAPI.fetch_map_conditions()
+            events = await self.api.fetch_map_conditions()
 
             if events is None:
                 logger.error("Failed to fetch map conditions")
@@ -183,20 +178,22 @@ class ConditionBot(discord.Client):
         """Wait until bot is ready before starting updates"""
         await self.wait_until_ready()
 
+    # ── Formatters ──────────────────────────────────────────────
+
     def format_current_event_message(self, events: List[Dict]) -> str:
         """Format a compact message showing only the active event for the pinned header."""
         current_time_ms = int(time.time() * 1000)
         active_events = [
             e for e in events
-            if e['startTime'] <= current_time_ms <= e['endTime']
+            if e.get('startTime', 0) <= current_time_ms <= e.get('endTime', 0)
         ]
 
         lines = ["## 🔴 Current Map Condition"]
         if active_events:
             for event in active_events:
-                end_time = event['endTime'] // 1000
+                end_time = event.get('endTime', 0) // 1000
                 lines.append(
-                    f"**{event['name']}** on **{event['map']}**\n"
+                    f"**{event.get('name', '?')}** on **{event.get('map', '?')}**\n"
                     f"└ Ends: <t:{end_time}:t> (<t:{end_time}:R>)"
                 )
         else:
@@ -206,41 +203,29 @@ class ConditionBot(discord.Client):
         return "\n".join(lines)
 
     def format_conditions_message(self, events: List[Dict]) -> str:
-        """
-        Format events into a Discord message
-
-        Args:
-            events: List of event dictionaries
-
-        Returns:
-            Formatted message string
-        """
+        """Format events into a Discord message."""
         current_time_ms = int(time.time() * 1000)
 
-        # Section 1: Active events
         active_events = [
             e for e in events
-            if e['startTime'] <= current_time_ms <= e['endTime']
+            if e.get('startTime', 0) <= current_time_ms <= e.get('endTime', 0)
         ]
 
-        # Section 2: Upcoming events
         upcoming_events = [
             e for e in events
-            if e['startTime'] > current_time_ms
+            if e.get('startTime', 0) > current_time_ms
         ]
-        upcoming_events.sort(key=lambda x: x['startTime'])
-        upcoming_events = upcoming_events[:8]  # Next 8 events
+        upcoming_events.sort(key=lambda x: x.get('startTime', 0))
+        upcoming_events = upcoming_events[:8]
 
-        # Build message
         lines = ["# 🎮 ARC Raiders Map Conditions\n"]
 
-        # Active Now section
         lines.append("## 🔴 Active Now")
         if active_events:
             for event in active_events:
-                condition = event['name']
-                map_name = event['map']
-                end_time = event['endTime'] // 1000  # Convert to seconds
+                condition = event.get('name', '?')
+                map_name = event.get('map', '?')
+                end_time = event.get('endTime', 0) // 1000
 
                 lines.append(
                     f"**{condition}** on **{map_name}**\n"
@@ -249,15 +234,14 @@ class ConditionBot(discord.Client):
         else:
             lines.append("*No active events*")
 
-        lines.append("")  # Empty line separator
+        lines.append("")
 
-        # Coming Up section
         lines.append("## 📅 Coming Up (Next 8)")
         if upcoming_events:
             for event in upcoming_events:
-                condition = event['name']
-                map_name = event['map']
-                start_time = event['startTime'] // 1000  # Convert to seconds
+                condition = event.get('name', '?')
+                map_name = event.get('map', '?')
+                start_time = event.get('startTime', 0) // 1000
 
                 lines.append(
                     f"**{condition}** on **{map_name}**\n"
@@ -269,6 +253,94 @@ class ConditionBot(discord.Client):
         lines.append(f"\n*Last updated: <t:{int(time.time())}:R>*")
 
         return "\n".join(lines)
+
+    def format_trader_message(self, trader_name: str, items: List[Dict]) -> str:
+        """Format a trader's inventory into a Discord message."""
+        lines = [f"# 🛒 {trader_name}'s Inventory\n"]
+        for item in items:
+            emoji = RARITY_EMOJI.get(item.get('rarity', ''), '⬜')
+            price = f"{item['trader_price']:,}" if item.get('trader_price') else 'N/A'
+            lines.append(
+                f"{emoji} **{item.get('name', '?')}** — {item.get('rarity', '?')} {item.get('item_type', '')}\n"
+                f"└ Price: **{price}** | {item.get('description', '')}"
+            )
+        return "\n".join(lines)
+
+    def format_search_results(self, query: str, items: List[Dict], total: int) -> str:
+        """Format item search results into a Discord message."""
+        shown = len(items)
+        header = f"# 🔍 Search: *{discord.utils.escape_markdown(query)}*"
+        if total == 0:
+            return f"{header}\n*No items found.*"
+
+        lines = [header]
+        if total > shown:
+            lines.append(f"*Showing {shown} of {total} results — try a more specific search.*\n")
+        else:
+            lines.append(f"*{total} result{'s' if total != 1 else ''} found.*\n")
+
+        for item in items:
+            emoji = RARITY_EMOJI.get(item.get('rarity', ''), '⬜')
+            meta = ' · '.join(filter(None, [item.get('rarity'), item.get('item_type')]))
+            lines.append(f"{emoji} **{item.get('name', '?')}**" + (f" — {meta}" if meta else ''))
+
+            details = []
+            if item.get('value'):
+                details.append(f"Value: **{item['value']:,}**")
+            if item.get('workbench'):
+                details.append(f"Crafted at: **{item['workbench']}**")
+            if item.get('loot_area'):
+                details.append(f"Loot: **{item['loot_area']}**")
+            if details:
+                lines.append(f"└ {' | '.join(details)}")
+
+            if item.get('description'):
+                lines.append(f"  *{item['description']}*")
+
+            components = item.get('components') or []
+            if components:
+                parts = ', '.join(
+                    f"**{c.get('quantity', '?')}x** {c.get('component', {}).get('name', '?')}"
+                    for c in components
+                )
+                lines.append(f"  🔧 Requires: {parts}")
+
+            sold_by = item.get('sold_by') or []
+            if sold_by:
+                traders = ', '.join(
+                    f"{s.get('trader_name', '?')} (**{s.get('price', 0):,}**)"
+                    for s in sold_by
+                )
+                lines.append(f"  🛒 Sold by: {traders}")
+
+        return "\n".join(lines)
+
+    # ── Message management ──────────────────────────────────────
+
+    @staticmethod
+    def _split_message(text: str, limit: int = 2000) -> List[str]:
+        """Split a message into chunks that fit within Discord's character limit."""
+        chunks, current = [], []
+        current_len = 0
+        for line in text.split('\n'):
+            line_len = len(line) + 1  # +1 for the newline we rejoin with
+            # Flush current buffer if adding this line would exceed limit
+            if current_len + line_len > limit and current:
+                chunks.append('\n'.join(current))
+                current, current_len = [], 0
+            # If a single line itself exceeds the limit, hard-wrap it
+            if len(line) >= limit:
+                while line:
+                    current.append(line[:limit - 1])
+                    chunks.append('\n'.join(current))
+                    current, current_len = [], 0
+                    line = line[limit - 1:]
+            else:
+                current.append(line)
+                current_len += line_len
+        if current:
+            chunks.append('\n'.join(current))
+        return chunks
 
     async def post_schedule_message(self, content: str):
         """Send or edit the full schedule message (not pinned)."""
@@ -343,7 +415,7 @@ class ConditionBot(discord.Client):
             async for pin in channel.pins():
                 if pin.author == self.user and "Current Map Condition" in pin.content:
                     self.current_pin = pin
-                    self.current_pin_verified = True  # found in pins → already pinned
+                    self.current_pin_verified = True
                     await self.current_pin.edit(content=content)
                     logger.info("Found and updated existing current event pin")
                     return
@@ -369,133 +441,70 @@ class ConditionBot(discord.Client):
         except Exception as e:
             logger.error(f"Error posting/updating current event pin: {e}", exc_info=True)
 
-    @staticmethod
-    def _split_message(text: str, limit: int = 2000) -> List[str]:
-        """Split a message into chunks that fit within Discord's character limit."""
-        chunks, current = [], []
-        current_len = 0
-        for line in text.split('\n'):
-            # +1 for the newline we'll rejoin with
-            if current_len + len(line) + 1 > limit and current:
-                chunks.append('\n'.join(current))
-                current, current_len = [], 0
-            current.append(line)
-            current_len += len(line) + 1
-        if current:
-            chunks.append('\n'.join(current))
-        return chunks
 
-    def format_trader_message(self, trader_name: str, items: List[Dict]) -> str:
-        """Format a trader's inventory into a Discord message."""
-        lines = [f"# 🛒 {trader_name}'s Inventory\n"]
-        for item in items:
-            emoji = RARITY_EMOJI.get(item.get('rarity', ''), '⬜')
-            price = f"{item['trader_price']:,}" if item.get('trader_price') else 'N/A'
-            lines.append(
-                f"{emoji} **{item['name']}** — {item.get('rarity', '?')} {item.get('item_type', '')}\n"
-                f"└ Price: **{price}** | {item.get('description', '')}"
-            )
-        return "\n".join(lines)
+class ConditionCommands(commands.Cog):
+    """User-facing commands."""
 
-    def format_search_results(self, query: str, items: List[Dict], total: int) -> str:
-        """Format item search results into a Discord message."""
-        shown = len(items)
-        header = f"# 🔍 Search: *{query}*"
-        if total == 0:
-            return f"{header}\n*No items found.*"
+    def __init__(self, bot: ConditionBot):
+        self.bot = bot
 
-        lines = [header]
-        if total > shown:
-            lines.append(f"*Showing {shown} of {total} results — try a more specific search.*\n")
-        else:
-            lines.append(f"*{total} result{'s' if total != 1 else ''} found.*\n")
+    @commands.command(name='conditions')
+    @in_bot_channel()
+    @commands.cooldown(1, 10, commands.BucketType.channel)
+    async def conditions(self, ctx: commands.Context):
+        """Show current and upcoming map conditions."""
+        events = await self.bot.api.fetch_map_conditions()
+        if events is None:
+            await ctx.send("Failed to fetch map conditions.")
+            return
+        await self.bot.post_or_update_current_pin(self.bot.format_current_event_message(events))
+        await ctx.send(content=self.bot.format_conditions_message(events))
 
-        for item in items:
-            emoji = RARITY_EMOJI.get(item.get('rarity', ''), '⬜')
-            meta = ' · '.join(filter(None, [item.get('rarity'), item.get('item_type')]))
-            lines.append(f"{emoji} **{item['name']}**" + (f" — {meta}" if meta else ''))
-
-            details = []
-            if item.get('value'):
-                details.append(f"Value: **{item['value']:,}**")
-            if item.get('workbench'):
-                details.append(f"Crafted at: **{item['workbench']}**")
-            if item.get('loot_area'):
-                details.append(f"Loot: **{item['loot_area']}**")
-            if details:
-                lines.append(f"└ {' | '.join(details)}")
-
-            if item.get('description'):
-                lines.append(f"  *{item['description']}*")
-
-            components = item.get('components') or []
-            if components:
-                parts = ', '.join(
-                    f"**{c['quantity']}x** {c['component']['name']}"
-                    for c in components
-                )
-                lines.append(f"  🔧 Requires: {parts}")
-
-            sold_by = item.get('sold_by') or []
-            if sold_by:
-                traders = ', '.join(
-                    f"{s['trader_name']} (**{s['price']:,}**)"
-                    for s in sold_by
-                )
-                lines.append(f"  🛒 Sold by: {traders}")
-
-        return "\n".join(lines)
-
-    async def on_message(self, message: discord.Message):
-        """Handle incoming messages for commands."""
-        if message.author == self.user:
+    @commands.command(name='traders')
+    @in_bot_channel()
+    @commands.cooldown(1, 10, commands.BucketType.channel)
+    async def traders(self, ctx: commands.Context, *, name: str):
+        """List a trader's inventory. Usage: !traders <name>"""
+        traders = await self.bot.api.fetch_traders()
+        if traders is None:
+            await ctx.send("Failed to fetch trader data.")
             return
 
-        content = message.content.strip()
+        match = next((n for n in traders if n.lower() == name.lower()), None)
+        if match is None:
+            available = ', '.join(f'`{n}`' for n in sorted(traders.keys()))
+            await ctx.send(f"Unknown trader **{discord.utils.escape_markdown(name)}**. Available traders: {available}")
+            return
 
-        if content == '!conditions':
-            events = ARCRaidersAPI.fetch_map_conditions()
-            if events is None:
-                await message.channel.send("Failed to fetch map conditions.")
-                return
-            await self.post_or_update_current_pin(self.format_current_event_message(events))
-            await message.channel.send(content=self.format_conditions_message(events))
+        for chunk in self.bot._split_message(self.bot.format_trader_message(match, traders[match])):
+            await ctx.send(content=chunk)
 
-        elif content.lower().startswith('!traders '):
-            traders = ARCRaidersAPI.fetch_traders()
-            if traders is None:
-                await message.channel.send("Failed to fetch trader data.")
-                return
+    @commands.command(name='search')
+    @in_bot_channel()
+    @commands.cooldown(1, 10, commands.BucketType.channel)
+    async def search(self, ctx: commands.Context, *, query: str):
+        """Search for items by name. Usage: !search <item name>"""
+        result = await self.bot.api.fetch_items(query)
+        if result is None:
+            await ctx.send("Failed to fetch item data.")
+            return
 
-            requested = content[9:].strip()
-            # Case-insensitive match against available trader names
-            match = next((name for name in traders if name.lower() == requested.lower()), None)
-            if match is None:
-                available = ', '.join(f'`{n}`' for n in sorted(traders.keys()))
-                await message.channel.send(
-                    f"Unknown trader **{requested}**. Available traders: {available}"
-                )
-                return
+        items = result.get('data', [])
+        total = result.get('pagination', {}).get('total', 0)
+        formatted = self.bot.format_search_results(query, items, total)
+        for chunk in self.bot._split_message(formatted):
+            await ctx.send(content=chunk)
 
-            for chunk in self._split_message(self.format_trader_message(match, traders[match])):
-                await message.channel.send(content=chunk)
-
-        elif content.lower().startswith('!search '):
-            query = content[8:].strip()
-            if not query:
-                await message.channel.send("Usage: `!Search <item name>`")
-                return
-
-            result = ARCRaidersAPI.fetch_items(query)
-            if result is None:
-                await message.channel.send("Failed to fetch item data.")
-                return
-
-            items = result['data']
-            total = result['pagination']['total']
-            formatted = self.format_search_results(query, items, total)
-            for chunk in self._split_message(formatted):
-                await message.channel.send(content=chunk)
+    @conditions.error
+    @traders.error
+    @search.error
+    async def on_command_error(self, ctx: commands.Context, error: commands.CommandError):
+        if isinstance(error, commands.CommandOnCooldown):
+            await ctx.send(f"Command on cooldown — try again in {error.retry_after:.0f}s.")
+        elif isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send(f"Missing argument. Usage: `!{ctx.command.name} <{error.param.name}>`")
+        elif isinstance(error, commands.CheckFailure):
+            pass  # Silently ignore commands in wrong channel
 
 
 def main():
@@ -508,14 +517,15 @@ def main():
         logger.error("DISCORD_CHANNEL_ID not found in environment variables")
         return
 
-    # Set up intents
-    # message_content is a privileged intent — enable it at:
-    # https://discord.com/developers/applications/ → Bot → Privileged Gateway Intents
     intents = discord.Intents.default()
     intents.message_content = True
 
-    # Create and run bot
-    bot = ConditionBot(intents=intents)
+    bot = ConditionBot(
+        command_prefix='!',
+        intents=intents,
+        allowed_mentions=discord.AllowedMentions.none(),
+        case_insensitive=True,
+    )
 
     try:
         bot.run(DISCORD_BOT_TOKEN)
