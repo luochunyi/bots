@@ -30,6 +30,7 @@ DISCORD_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', 0))
 # Constants
 EVENTS_API_URL = 'https://metaforge.app/api/arc-raiders/events-schedule'
 TRADERS_API_URL = 'https://metaforge.app/api/arc-raiders/traders'
+ITEMS_API_URL = 'https://metaforge.app/api/arc-raiders/items'
 
 RARITY_EMOJI = {
     'Common': '⬜',
@@ -85,6 +86,31 @@ class ARCRaidersAPI:
             return None
         except Exception as e:
             logger.error(f"Unexpected error fetching traders: {e}")
+            return None
+
+    @staticmethod
+    def fetch_items(query: str) -> Optional[Dict]:
+        """
+        Search items by name via the Metaforge API.
+
+        Returns:
+            Dict with 'data' (list of items) and 'pagination', or None on error.
+        """
+        try:
+            response = requests.get(
+                ITEMS_API_URL,
+                params={'search': query, 'limit': 50},
+                timeout=10,
+            )
+            response.raise_for_status()
+            data = response.json()
+            logger.info(f"Item search '{query}' returned {data['pagination']['total']} results")
+            return data
+        except requests.RequestException as e:
+            logger.error(f"Error fetching items: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error fetching items: {e}")
             return None
 
 
@@ -371,6 +397,46 @@ class ConditionBot(discord.Client):
             )
         return "\n".join(lines)
 
+    def format_search_results(self, query: str, items: List[Dict], total: int) -> str:
+        """Format item search results into a Discord message."""
+        shown = len(items)
+        header = f"# 🔍 Search: *{query}*"
+        if total == 0:
+            return f"{header}\n*No items found.*"
+
+        lines = [header]
+        if total > shown:
+            lines.append(f"*Showing {shown} of {total} results — try a more specific search.*\n")
+        else:
+            lines.append(f"*{total} result{'s' if total != 1 else ''} found.*\n")
+
+        for item in items:
+            emoji = RARITY_EMOJI.get(item.get('rarity', ''), '⬜')
+            parts = [f"{emoji} **{item['name']}**"]
+            meta = []
+            if item.get('rarity'):
+                meta.append(item['rarity'])
+            if item.get('item_type'):
+                meta.append(item['item_type'])
+            if meta:
+                parts.append(f" — {' · '.join(meta)}")
+            lines.append(''.join(parts))
+
+            details = []
+            if item.get('value'):
+                details.append(f"Value: **{item['value']:,}**")
+            if item.get('workbench'):
+                details.append(f"Crafted at: **{item['workbench']}**")
+            if item.get('loot_area'):
+                details.append(f"Loot: **{item['loot_area']}**")
+            if details:
+                lines.append(f"└ {' | '.join(details)}")
+
+            if item.get('description'):
+                lines.append(f"  *{item['description']}*")
+
+        return "\n".join(lines)
+
     async def on_message(self, message: discord.Message):
         """Handle incoming messages for commands."""
         if message.author == self.user:
@@ -403,6 +469,23 @@ class ConditionBot(discord.Client):
                 return
 
             for chunk in self._split_message(self.format_trader_message(match, traders[match])):
+                await message.channel.send(content=chunk)
+
+        elif content.lower().startswith('!search '):
+            query = content[8:].strip()
+            if not query:
+                await message.channel.send("Usage: `!Search <item name>`")
+                return
+
+            result = ARCRaidersAPI.fetch_items(query)
+            if result is None:
+                await message.channel.send("Failed to fetch item data.")
+                return
+
+            items = result['data']
+            total = result['pagination']['total']
+            formatted = self.format_search_results(query, items, total)
+            for chunk in self._split_message(formatted):
                 await message.channel.send(content=chunk)
 
 
