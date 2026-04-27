@@ -489,8 +489,8 @@ class ConditionCommands(commands.Cog):
             await ctx.send("Failed to fetch item data.")
             return
 
-        items = result.get('data', [])
-        total = result.get('pagination', {}).get('total', 0)
+        items = [i for i in result.get('data', []) if i.get('item_type') != 'Misc']
+        total = len(items)
         formatted = self.bot.format_search_results(query, items, total)
         for chunk in self.bot._split_message(formatted):
             await ctx.send(content=chunk)
