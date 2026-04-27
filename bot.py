@@ -7,7 +7,6 @@ Fetches and posts map condition schedules to a Discord channel
 import os
 import time
 import logging
-from datetime import time as dt_time
 from typing import List, Dict, Optional
 
 import discord
@@ -30,9 +29,6 @@ DISCORD_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', 0))
 
 # Constants
 EVENTS_API_URL = 'https://metaforge.app/api/arc-raiders/events-schedule'
-
-# Fire at every XX:00 and XX:30 UTC
-UPDATE_TIMES = [dt_time(hour=h, minute=m) for h in range(24) for m in (0, 30)]
 
 
 class ARCRaidersAPI:
@@ -108,7 +104,7 @@ class ConditionBot(discord.Client):
         """Called when bot disconnects"""
         logger.warning("Bot disconnected")
 
-    @tasks.loop(time=UPDATE_TIMES)
+    @tasks.loop(minutes=30)
     async def update_conditions(self):
         """Periodically fetch and update map conditions"""
         try:
