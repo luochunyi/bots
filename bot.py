@@ -256,8 +256,8 @@ class ConditionBot(discord.Client):
         if self.current_pin_verified:
             return
         try:
-            pins = await message.channel.pins()
-            if message.id in {p.id for p in pins}:
+            pins = {p.id async for p in message.channel.pins()}
+            if message.id in pins:
                 self.current_pin_verified = True
                 return
             await message.pin()
@@ -287,7 +287,7 @@ class ConditionBot(discord.Client):
                     self.current_pin_verified = False
 
             # Search pinned messages first
-            for pin in await channel.pins():
+            async for pin in channel.pins():
                 if pin.author == self.user and "Current Map Condition" in pin.content:
                     self.current_pin = pin
                     self.current_pin_verified = True  # found in pins → already pinned
