@@ -5,12 +5,9 @@ Fetches and posts map condition schedules to a Discord channel
 """
 
 import os
-import re
-import json
 import time
-import asyncio
 import logging
-from datetime import datetime, time as dt_time
+from datetime import time as dt_time
 from typing import List, Dict, Optional
 
 import discord
@@ -32,63 +29,32 @@ DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 DISCORD_CHANNEL_ID = int(os.getenv('DISCORD_CHANNEL_ID', 0))
 
 # Constants
-ARC_RAIDERS_URL = 'https://arcraiders.com/map-conditions'
-BROWSER_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+EVENTS_API_URL = 'https://metaforge.app/api/arc-raiders/events-schedule'
 
 # Fire at every XX:00 and XX:30 UTC
 UPDATE_TIMES = [dt_time(hour=h, minute=m) for h in range(24) for m in (0, 30)]
 
 
 class ARCRaidersAPI:
-    """Handles fetching and parsing ARC Raiders map condition data"""
+    """Handles fetching ARC Raiders event schedule data"""
 
     @staticmethod
     def fetch_map_conditions() -> Optional[List[Dict]]:
         """
-        Fetch and parse map conditions from ARC Raiders website
+        Fetch event schedule from the Metaforge API.
 
         Returns:
-            List of event dictionaries or None on error
+            List of event dictionaries or None on error.
         """
         try:
-            headers = {'User-Agent': BROWSER_USER_AGENT}
-            response = requests.get(ARC_RAIDERS_URL, headers=headers, timeout=10)
+            response = requests.get(EVENTS_API_URL, timeout=10)
             response.raise_for_status()
-
-            html_content = response.text
-            logger.info("Successfully fetched HTML content")
-
-            # Find the script block containing liveEntries
-            pattern = r'self\.__next_f\.push\(\[1,"(.*liveEntries.*?)"\]\)'
-            script_match = re.search(pattern, html_content, re.DOTALL)
-
-            if not script_match:
-                logger.error("Script block not found")
-                return None
-
-            # Unescape the JavaScript string
-            unescaped = (script_match.group(1)
-                         .replace(r'\"', '"')
-                         .replace(r'\\', '\\')
-                         .replace(r'\n', ''))
-
-            # Extract liveEntries JSON array
-            entries_pattern = r'"liveEntries":(\[.*?\]),"currentCondition"'
-            entries_match = re.search(entries_pattern, unescaped, re.DOTALL)
-
-            if entries_match:
-                events = json.loads(entries_match.group(1))
-                logger.info(f"Successfully parsed {len(events)} events")
-                return events
-
-            logger.error("Could not find liveEntries in HTML content")
-            return None
-
+            data = response.json()
+            events = data.get('data', [])
+            logger.info(f"Successfully fetched {len(events)} events")
+            return events
         except requests.RequestException as e:
             logger.error(f"Error fetching data: {e}")
-            return None
-        except json.JSONDecodeError as e:
-            logger.error(f"Error parsing JSON: {e}")
             return None
         except Exception as e:
             logger.error(f"Unexpected error: {e}")
@@ -169,15 +135,15 @@ class ConditionBot(discord.Client):
         current_time_ms = int(time.time() * 1000)
         active_events = [
             e for e in events
-            if e['startTimestamp'] <= current_time_ms <= e['endTimestamp']
+            if e['startTime'] <= current_time_ms <= e['endTime']
         ]
 
         lines = ["## 🔴 Current Map Condition"]
         if active_events:
             for event in active_events:
-                end_time = event['endTimestamp'] // 1000
+                end_time = event['endTime'] // 1000
                 lines.append(
-                    f"**{event['conditionName']}** on **{event['mapDisplayName']}**\n"
+                    f"**{event['name']}** on **{event['map']}**\n"
                     f"└ Ends: <t:{end_time}:t> (<t:{end_time}:R>)"
                 )
         else:
@@ -201,15 +167,15 @@ class ConditionBot(discord.Client):
         # Section 1: Active events
         active_events = [
             e for e in events
-            if e['startTimestamp'] <= current_time_ms <= e['endTimestamp']
+            if e['startTime'] <= current_time_ms <= e['endTime']
         ]
 
         # Section 2: Upcoming events
         upcoming_events = [
             e for e in events
-            if e['startTimestamp'] > current_time_ms
+            if e['startTime'] > current_time_ms
         ]
-        upcoming_events.sort(key=lambda x: x['startTimestamp'])
+        upcoming_events.sort(key=lambda x: x['startTime'])
         upcoming_events = upcoming_events[:8]  # Next 8 events
 
         # Build message
@@ -219,9 +185,9 @@ class ConditionBot(discord.Client):
         lines.append("## 🔴 Active Now")
         if active_events:
             for event in active_events:
-                condition = event['conditionName']
-                map_name = event['mapDisplayName']
-                end_time = event['endTimestamp'] // 1000  # Convert to seconds
+                condition = event['name']
+                map_name = event['map']
+                end_time = event['endTime'] // 1000  # Convert to seconds
 
                 lines.append(
                     f"**{condition}** on **{map_name}**\n"
@@ -236,9 +202,9 @@ class ConditionBot(discord.Client):
         lines.append("## 📅 Coming Up (Next 8)")
         if upcoming_events:
             for event in upcoming_events:
-                condition = event['conditionName']
-                map_name = event['mapDisplayName']
-                start_time = event['startTimestamp'] // 1000  # Convert to seconds
+                condition = event['name']
+                map_name = event['map']
+                start_time = event['startTime'] // 1000  # Convert to seconds
 
                 lines.append(
                     f"**{condition}** on **{map_name}**\n"
