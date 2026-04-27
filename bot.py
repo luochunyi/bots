@@ -99,7 +99,7 @@ class ARCRaidersAPI:
         try:
             response = requests.get(
                 ITEMS_API_URL,
-                params={'search': query, 'limit': 50},
+                params={'search': query, 'limit': 50, 'includeComponents': 'true'},
                 timeout=10,
             )
             response.raise_for_status()
@@ -412,15 +412,8 @@ class ConditionBot(discord.Client):
 
         for item in items:
             emoji = RARITY_EMOJI.get(item.get('rarity', ''), '⬜')
-            parts = [f"{emoji} **{item['name']}**"]
-            meta = []
-            if item.get('rarity'):
-                meta.append(item['rarity'])
-            if item.get('item_type'):
-                meta.append(item['item_type'])
-            if meta:
-                parts.append(f" — {' · '.join(meta)}")
-            lines.append(''.join(parts))
+            meta = ' · '.join(filter(None, [item.get('rarity'), item.get('item_type')]))
+            lines.append(f"{emoji} **{item['name']}**" + (f" — {meta}" if meta else ''))
 
             details = []
             if item.get('value'):
@@ -434,6 +427,22 @@ class ConditionBot(discord.Client):
 
             if item.get('description'):
                 lines.append(f"  *{item['description']}*")
+
+            components = item.get('components') or []
+            if components:
+                parts = ', '.join(
+                    f"**{c['quantity']}x** {c['component']['name']}"
+                    for c in components
+                )
+                lines.append(f"  🔧 Requires: {parts}")
+
+            sold_by = item.get('sold_by') or []
+            if sold_by:
+                traders = ', '.join(
+                    f"{s['trader_name']} (**{s['price']:,}**)"
+                    for s in sold_by
+                )
+                lines.append(f"  🛒 Sold by: {traders}")
 
         return "\n".join(lines)
 
